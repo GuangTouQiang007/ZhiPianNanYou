@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { ImageGenerationClient, Config, HeaderUtils } from 'coze-coding-dev-sdk';
+import { imageCache, hashKey } from '@/lib/cache';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -10,6 +11,13 @@ export async function POST(request: NextRequest) {
 
     if (!prompt) {
       return NextResponse.json({ error: '缺少图像描述' }, { status: 400 });
+    }
+
+    // 查缓存：相同 prompt 直接返回
+    const cacheKey = hashKey(prompt);
+    const cached = imageCache.get(cacheKey);
+    if (cached) {
+      return NextResponse.json({ success: true, ...cached, fromCache: true });
     }
 
     // 创建图像生成客户端
@@ -27,10 +35,12 @@ export async function POST(request: NextRequest) {
     const helper = client.getResponseHelper(response);
 
     if (helper.success && helper.imageUrls.length > 0) {
-      return NextResponse.json({ 
-        success: true,
-        imageUrl: helper.imageUrls[0]
-      });
+      const result = { imageUrl: helper.imageUrls[0] };
+
+      // 写入缓存
+      imageCache.set(cacheKey, result);
+
+      return NextResponse.json({ success: true, ...result });
     } else {
       return NextResponse.json({ 
         success: false,

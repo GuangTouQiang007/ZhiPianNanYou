@@ -1,6 +1,7 @@
 import { NextRequest } from 'next/server';
 import { LLMClient, Config, HeaderUtils } from 'coze-coding-dev-sdk';
 import { getCharacterById, generateSystemPrompt, UserMemory, Message, IMAGE_TRIGGER_KEYWORDS } from '@/lib/characters';
+import { promptCache, hashKey } from '@/lib/cache';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -89,7 +90,14 @@ export async function POST(request: NextRequest) {
 
     // 构建消息历史（滑动窗口：最近15轮）
     const recentMessages = session.messages.slice(-30);
-    const systemPrompt = generateSystemPrompt(character, session.memory, session.roundNumber, hasKeywordTrigger);
+
+    // 缓存 System Prompt 生成结果
+    const promptCacheKey = hashKey(characterId, JSON.stringify(session.memory), String(session.roundNumber), String(hasKeywordTrigger));
+    let systemPrompt = promptCache.get(promptCacheKey);
+    if (!systemPrompt) {
+      systemPrompt = generateSystemPrompt(character, session.memory, session.roundNumber, hasKeywordTrigger);
+      promptCache.set(promptCacheKey, systemPrompt);
+    }
 
     // 构建LLM消息
     const llmMessages = [

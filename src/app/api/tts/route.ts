@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { TTSClient, Config, HeaderUtils } from 'coze-coding-dev-sdk';
 import { getCharacterById } from '@/lib/characters';
+import { ttsCache, hashKey } from '@/lib/cache';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -22,6 +23,13 @@ export async function POST(request: NextRequest) {
       }
     }
 
+    // 查缓存：相同文本+音色直接返回
+    const cacheKey = hashKey(text, voiceId);
+    const cached = ttsCache.get(cacheKey);
+    if (cached) {
+      return NextResponse.json({ success: true, ...cached, fromCache: true });
+    }
+
     // 创建TTS客户端
     const config = new Config();
     const customHeaders = HeaderUtils.extractForwardHeaders(request.headers);
@@ -36,11 +44,15 @@ export async function POST(request: NextRequest) {
       sampleRate: 24000
     });
 
-    return NextResponse.json({ 
-      success: true,
+    const result = {
       audioUrl: response.audioUri,
-      audioSize: response.audioSize
-    });
+      audioSize: response.audioSize,
+    };
+
+    // 写入缓存
+    ttsCache.set(cacheKey, result);
+
+    return NextResponse.json({ success: true, ...result });
 
   } catch (error) {
     console.error('TTS API error:', error);
