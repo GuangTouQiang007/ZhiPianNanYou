@@ -1,0 +1,25 @@
+﻿{
+  "mcpServers": {
+    "github": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-github"],
+      "env": {
+        "GITHUB_TOKEN": "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"
+      },
+      "channels": ["pulls", "issues", "push"]
+    }
+  },
+ "hooks": {
+  "PreToolUse": [
+    {
+      "matcher": "",
+      "hooks": [
+        {
+          "type": "command",
+          "command": "powershell -ExecutionPolicy Bypass -File .claude/hooks/run-tests.ps1"
+        }
+      ]
+    }
+  ]
+}
+}

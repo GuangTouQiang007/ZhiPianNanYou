@@ -1,126 +1,158 @@
-import { NextRequest } from 'next/server';
+import { NextRequest, NextResponse } from 'next/server';
 import { LLMClient, Config, HeaderUtils } from 'coze-coding-dev-sdk';
-import { getCharacterById, generateSystemPrompt, UserMemory, Message, IMAGE_TRIGGER_KEYWORDS } from '@/lib/characters';
+import { getCharacterById, generateSystemPrompt, UserMemory, IMAGE_TRIGGER_KEYWORDS } from '@/lib/characters';
 import { promptCache, hashKey } from '@/lib/cache';
+import { withAuth } from '@/lib/auth/api-auth';
+import { db, conversations, messages, userMemories, profiles, characterFavorability } from '@/lib/db';
+import { eq, desc, and } from 'drizzle-orm';
+import { getLevelFromScore, applyDelta, didLevelChange, FavorabilityData } from '@/lib/favorability';
+import { findMatchingBranch, detectUserEmotion, computeCharacterEmotion, generateEmotionPromptFragment, extractTopics } from '@/lib/dialogue';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
 
-// 对话上下文存储（简单内存存储，刷新后清空）
-const conversationStore = new Map<string, { messages: Message[], memory: UserMemory, roundNumber: number }>();
-
-/**
- * 清理回复中的动作描述和特殊标记
- * 用于TTS语音生成和最终显示
- */
 function cleanReplyContent(content: string): string {
   let cleaned = content;
-  
-  // 1. 移除动作描述（先保存特殊指令）
-  // 移除中文括号内的动作描述：（微笑）、（叹气）等
   cleaned = cleaned.replace(/（[^）]*）/g, '');
-  // 移除英文括号内的动作描述：(smile)、(sigh)等
   cleaned = cleaned.replace(/\([^)]*\)/g, '');
-  // 移除星号包裹的动作描述：*微笑*、*叹气*等
   cleaned = cleaned.replace(/\*[^*]+\*/g, '');
-  // 移除【】内的动作描述（但要保留[IMAGE:...]和[MEMORY:...]）
   cleaned = cleaned.replace(/【[^】]*】/g, '');
-  
-  // 2. 移除系统指令标记
   cleaned = cleaned.replace(/\[MEMORY:\s*[^\]]+\]/g, '');
   cleaned = cleaned.replace(/\[IMAGE:\s*[^\]]+\]/g, '');
-  
-  // 3. 清理多余空白
+  cleaned = cleaned.replace(/\[AFFECTION:\s*[^\]]+\]/g, '');
   cleaned = cleaned.replace(/\s+/g, ' ').trim();
-  
-  // 4. 清理开头结尾的标点符号问题
   cleaned = cleaned.replace(/^[，。、；：！？\s]+/, '');
   cleaned = cleaned.replace(/[，。、；：！？\s]+$/, '');
-  
   return cleaned;
 }
 
-// 导出清理函数供TTS使用
 export { cleanReplyContent };
 
-export async function POST(request: NextRequest) {
+export const POST = withAuth(async (request, _context, userId) => {
   try {
-    const { characterId, userMessage, sessionId } = await request.json();
+    const { characterId, userMessage, conversationId } = await request.json();
 
-    if (!characterId || !userMessage || !sessionId) {
-      return new Response(JSON.stringify({ error: '缺少必要参数' }), { 
-        status: 400,
-        headers: { 'Content-Type': 'application/json' }
-      });
+    if (!characterId || !userMessage || !conversationId) {
+      return NextResponse.json({ error: '缺少必要参数' }, { status: 400 });
     }
 
     const character = getCharacterById(characterId);
     if (!character) {
-      return new Response(JSON.stringify({ error: '角色不存在' }), { 
-        status: 400,
-        headers: { 'Content-Type': 'application/json' }
-      });
+      return NextResponse.json({ error: '角色不存在' }, { status: 400 });
     }
 
-    // 获取或创建会话
-    let session = conversationStore.get(sessionId);
-    if (!session) {
-      session = { 
-        messages: [], 
-        memory: {} as UserMemory, 
-        roundNumber: 0 
-      };
-      conversationStore.set(sessionId, session);
+    const [conv] = await db.select()
+      .from(conversations)
+      .where(eq(conversations.id, conversationId))
+      .limit(1);
+
+    if (!conv || conv.userId !== userId) {
+      return NextResponse.json({ error: '对话不存在' }, { status: 404 });
     }
 
-    // 添加用户消息
-    const userMsg: Message = {
-      id: `user_${Date.now()}`,
+    const dbMessages = await db.select()
+      .from(messages)
+      .where(eq(messages.conversationId, conversationId))
+      .orderBy(desc(messages.createdAt))
+      .limit(30);
+
+    const recentMessages = dbMessages.reverse();
+
+    const memRows = await db.select()
+      .from(userMemories)
+      .where(eq(userMemories.conversationId, conversationId));
+    const memoryMap: Record<string, string> = {};
+    for (const row of memRows) {
+      memoryMap[row.key] = row.value;
+    }
+    const userMemory = memoryMap as unknown as UserMemory;
+
+    const [profile] = await db.select()
+      .from(profiles)
+      .where(eq(profiles.id, userId))
+      .limit(1);
+    if (profile?.displayName && !userMemory.name) {
+      userMemory.name = profile.displayName;
+    }
+
+    // 查询好感度
+    const [favRow] = await db.select()
+      .from(characterFavorability)
+      .where(and(eq(characterFavorability.userId, userId), eq(characterFavorability.characterId, characterId)))
+      .limit(1);
+    const favScore = favRow?.score ?? 0;
+    const favLevel = getLevelFromScore(favScore);
+
+    await db.insert(messages).values({
+      conversationId,
       role: 'user',
       content: userMessage,
-      timestamp: Date.now()
-    };
-    session.messages.push(userMsg);
-    session.roundNumber += 1;
+    });
 
-    // 检测用户消息是否包含触发图片的关键词
-    const hasKeywordTrigger = IMAGE_TRIGGER_KEYWORDS.some(keyword => 
+    const newRoundNumber = conv.roundNumber + 1;
+    await db.update(conversations)
+      .set({ roundNumber: newRoundNumber, updatedAt: new Date() })
+      .where(eq(conversations.id, conversationId));
+
+    const hasKeywordTrigger = IMAGE_TRIGGER_KEYWORDS.some(keyword =>
       userMessage.includes(keyword)
     );
 
-    // 构建消息历史（滑动窗口：最近15轮）
-    const recentMessages = session.messages.slice(-30);
+    const llmMessagesList = recentMessages.map(m => ({
+      role: m.role as 'user' | 'assistant',
+      content: m.content
+    }));
 
-    // 缓存 System Prompt 生成结果
-    const promptCacheKey = hashKey(characterId, JSON.stringify(session.memory), String(session.roundNumber), String(hasKeywordTrigger));
+    // Emotion & dialogue branch system
+    const userEmotion = detectUserEmotion(userMessage);
+    const defaultEmotion = { type: 'neutral' as const, intensity: 0, cause: '', timestamp: Date.now() };
+    const characterEmotion = computeCharacterEmotion(characterId, userEmotion, favScore, defaultEmotion);
+    const emotionFragment = generateEmotionPromptFragment(characterEmotion, characterId);
+
+    const topics = extractTopics(llmMessagesList);
+    const matchedBranch = findMatchingBranch(characterId, userMessage, favScore, characterEmotion.type, newRoundNumber, topics, []);
+
+    let branchFragment = '';
+    if (matchedBranch) {
+      const templates = matchedBranch.replyTemplates;
+      branchFragment = `\n### 当前对话情境\n根据当前对话氛围，参考以下回复方向（但不要生硬照搬）：
+${templates.map(t => `- "${t}"`).join('\n')}`;
+    }
+
+    // Favorability style description
+    const favStyle = character.favorabilityStyles?.find(s =>
+      favScore >= s.minScore && favScore <= s.maxScore
+    );
+    let favStyleFragment = '';
+    if (favStyle) {
+      favStyleFragment = `\n### 当前称呼方式\n对用户的称呼：${favStyle.addressForm}\n对话态度：${favStyle.styleDescription}`;
+    }
+
+    const promptCacheKey = hashKey(characterId, JSON.stringify(userMemory), String(newRoundNumber), String(hasKeywordTrigger), String(favScore), userEmotion, matchedBranch?.id ?? '');
     let systemPrompt = promptCache.get(promptCacheKey);
     if (!systemPrompt) {
-      systemPrompt = generateSystemPrompt(character, session.memory, session.roundNumber, hasKeywordTrigger);
+      systemPrompt = generateSystemPrompt(character, userMemory, newRoundNumber, hasKeywordTrigger, favScore, favLevel.name);
+      // Append emotion, branch, and favorability style fragments
+      systemPrompt += emotionFragment + branchFragment + favStyleFragment;
       promptCache.set(promptCacheKey, systemPrompt);
     }
 
-    // 构建LLM消息
     const llmMessages = [
       { role: 'system' as const, content: systemPrompt },
-      ...recentMessages.map(m => ({
-        role: m.role as 'user' | 'assistant',
-        content: m.content
-      }))
+      ...llmMessagesList,
     ];
 
-    // 创建LLM客户端
     const config = new Config();
     const customHeaders = HeaderUtils.extractForwardHeaders(request.headers);
     const client = new LLMClient(config, customHeaders);
 
-    // 创建流式响应
     const encoder = new TextEncoder();
     let fullContent = '';
 
     const stream = new ReadableStream({
       async start(controller) {
         try {
-          const llmStream = client.stream(llmMessages, { 
+          const llmStream = client.stream(llmMessages, {
             temperature: 0.8,
             model: 'doubao-seed-1-8-251228'
           });
@@ -129,42 +161,67 @@ export async function POST(request: NextRequest) {
             if (chunk.content) {
               const text = chunk.content.toString();
               fullContent += text;
-              
-              // 发送SSE格式数据
               controller.enqueue(encoder.encode(`data: ${JSON.stringify({ type: 'text', content: text })}\n\n`));
             }
           }
 
-          // 解析记忆和图片指令
           const memoryMatch = fullContent.match(/\[MEMORY:\s*(\w+)=([^\]]+)\]/);
           const imageMatch = fullContent.match(/\[IMAGE:\s*([^\]]+)\]/);
+          const affectionMatch = fullContent.match(/\[AFFECTION:\s*([+-]\d+)(?:\s+([^\]]+))?\]/);
 
-          // 更新记忆
-          if (memoryMatch && session) {
+          if (memoryMatch) {
             const [, key, value] = memoryMatch;
-            (session.memory as Record<string, string>)[key] = value.trim();
-          }
-
-          // 清理回复：移除动作描述和特殊标记
-          const cleanContent = cleanReplyContent(fullContent);
-
-          // 发送完成信号
-          controller.enqueue(encoder.encode(`data: ${JSON.stringify({ 
-            type: 'done', 
-            content: cleanContent,
-            hasImage: !!imageMatch,
-            imagePrompt: imageMatch ? imageMatch[1].trim() : null
-          })}\n\n`));
-
-          // 保存助手消息
-          if (session) {
-            session.messages.push({
-              id: `assistant_${Date.now()}`,
-              role: 'assistant',
-              content: cleanContent,
-              timestamp: Date.now()
+            await db.insert(userMemories).values({
+              conversationId,
+              key,
+              value: value.trim(),
+            }).onConflictDoUpdate({
+              target: [userMemories.conversationId, userMemories.key],
+              set: { value: value.trim() },
             });
           }
+
+          // 处理好感度变化
+          let newFavScore = favScore;
+          let favDelta = 0;
+          let favReason: string | null = null;
+          if (affectionMatch) {
+            favDelta = parseInt(affectionMatch[1]);
+            favReason = affectionMatch[2]?.trim() ?? null;
+            newFavScore = applyDelta(favScore, favDelta);
+            await db.insert(characterFavorability).values({
+              userId,
+              characterId,
+              score: newFavScore,
+            }).onConflictDoUpdate({
+              target: [characterFavorability.userId, characterFavorability.characterId],
+              set: { score: newFavScore, updatedAt: new Date() },
+            });
+          }
+
+          const cleanContent = cleanReplyContent(fullContent);
+
+          await db.insert(messages).values({
+            conversationId,
+            role: 'assistant',
+            content: cleanContent,
+          });
+
+          controller.enqueue(encoder.encode(`data: ${JSON.stringify({
+            type: 'done',
+            content: cleanContent,
+            hasImage: !!imageMatch,
+            imagePrompt: imageMatch ? imageMatch[1].trim() : null,
+            favorability: {
+              score: newFavScore,
+              delta: favDelta,
+              level: getLevelFromScore(newFavScore),
+              levelChanged: didLevelChange(favScore, newFavScore),
+              reason: favReason,
+            } as FavorabilityData,
+            emotion: characterEmotion,
+            branchId: matchedBranch?.id ?? null,
+          })}\n\n`));
 
           controller.close();
         } catch (error) {
@@ -182,12 +239,8 @@ export async function POST(request: NextRequest) {
         'Connection': 'keep-alive'
       }
     });
-
   } catch (error) {
     console.error('Chat API error:', error);
-    return new Response(JSON.stringify({ error: '服务器错误' }), { 
-      status: 500,
-      headers: { 'Content-Type': 'application/json' }
-    });
+    return NextResponse.json({ error: '服务器错误' }, { status: 500 });
   }
-}
+});

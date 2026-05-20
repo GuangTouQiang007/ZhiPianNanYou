@@ -8,6 +8,8 @@
     "preinstall": "npx only-allow pnpm",
     "lint": "eslint",
     "start": "bash ./scripts/start.sh",
+    "test": "vitest run",
+    "test:watch": "vitest",
     "ts-check": "tsc -p tsconfig.json"
   },
   "dependencies": {
@@ -76,6 +78,7 @@
     "@types/pg": "^8.16.0",
     "@types/react": "^19",
     "@types/react-dom": "^19",
+    "@vitejs/plugin-react": "^6.0.2",
     "eslint": "^9",
     "eslint-config-next": "16.1.1",
     "only-allow": "^1.2.2",
@@ -84,7 +87,8 @@
     "tailwindcss": "^4",
     "tsup": "^8.3.5",
     "tsx": "^4.19.2",
-    "typescript": "^5"
+    "typescript": "^5",
+    "vitest": "^4.1.6"
   },
   "packageManager": "pnpm@9.0.0",
   "engines": {

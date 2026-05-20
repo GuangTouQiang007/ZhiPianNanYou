@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(gh repo *)",
+      "mcp__github__*",
+      "PowerShell(gh issue *)"
+    ]
+  }
+}
