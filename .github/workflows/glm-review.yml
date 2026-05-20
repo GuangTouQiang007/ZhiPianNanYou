@@ -1,0 +1,39 @@
+name: GLM 代码审查
+
+on:
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  glm-review:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 安装 Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: 安装依赖
+        run: pip install zhipuai
+
+      - name: 获取代码变更
+        run: |
+          git diff origin/main...HEAD > diff.txt
+          echo "diff 文件已生成"
+          cat diff.txt
+
+      - name: 调用 GLM 审查代码
+        env:
+          GLM_API_KEY: ${{ secrets.GLM_API_KEY }}
+        run: python .github/scripts/glm_review.py
+
+      - name: 显示审查结果
+        run: cat review_result.txt
+
