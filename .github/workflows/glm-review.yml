@@ -21,7 +21,10 @@ jobs:
           python-version: '3.11'
 
       - name: 安装依赖
-        run: pip install zhipuai
+        run: |
+          pip install "zhipuai==2.0.1"
+          pip install sniffio httpx
+
 
       - name: 获取代码变更
         run: |
